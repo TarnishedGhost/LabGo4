@@ -1,56 +1,90 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
-	"github.com/roman-mazur/architecture-practice-4-template/httptools"
-	"github.com/roman-mazur/architecture-practice-4-template/signal"
+	"github.com/TarnishedGhost/LabGo4/httptools"
+	"github.com/TarnishedGhost/LabGo4/signal"
 )
 
-var port = flag.Int("port", 8080, "server port")
+type DatabaseResponse struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
 
-const confResponseDelaySec = "CONF_RESPONSE_DELAY_SEC"
-const confHealthFailure = "CONF_HEALTH_FAILURE"
+type TimestampRequest struct {
+	Value string `json:"value"`
+}
+
+var serverPort = flag.Int("port", 8080, "server port")
+
+const responseDelayEnv = "CONF_RESPONSE_DELAY_SEC"
+const healthFailureEnv = "CONF_HEALTH_FAILURE"
+const databaseURL = "http://db:8083/db"
 
 func main() {
-	h := new(http.ServeMux)
+	mux := http.NewServeMux()
+	httpClient := http.DefaultClient
 
-	h.HandleFunc("/health", func(rw http.ResponseWriter, r *http.Request) {
-		rw.Header().Set("content-type", "text/plain")
-		if failConfig := os.Getenv(confHealthFailure); failConfig == "true" {
-			rw.WriteHeader(http.StatusInternalServerError)
-			_, _ = rw.Write([]byte("FAILURE"))
-		} else {
-			rw.WriteHeader(http.StatusOK)
-			_, _ = rw.Write([]byte("OK"))
-		}
-	})
-
+	mux.HandleFunc("/health", healthCheckHandler)
 	report := make(Report)
 
-	h.HandleFunc("/api/v1/some-data", func(rw http.ResponseWriter, r *http.Request) {
-		respDelayString := os.Getenv(confResponseDelaySec)
-		if delaySec, parseErr := strconv.Atoi(respDelayString); parseErr == nil && delaySec > 0 && delaySec < 300 {
+	mux.HandleFunc("/api/v1/some-data", func(w http.ResponseWriter, r *http.Request) {
+		queryKey := r.URL.Query().Get("key")
+		resp, err := httpClient.Get(fmt.Sprintf("%s/%s", databaseURL, queryKey))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			w.WriteHeader(resp.StatusCode)
+			return
+		}
+
+		responseDelay := os.Getenv(responseDelayEnv)
+		if delaySec, err := strconv.Atoi(responseDelay); err == nil && delaySec > 0 && delaySec < 300 {
 			time.Sleep(time.Duration(delaySec) * time.Second)
 		}
 
 		report.Process(r)
 
-		rw.Header().Set("content-type", "application/json")
-		rw.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(rw).Encode([]string{
-			"1", "2",
-		})
+		var dbResponse DatabaseResponse
+		json.NewDecoder(resp.Body).Decode(&dbResponse)
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]string{"1", "2"})
 	})
 
-	h.Handle("/report", report)
+	mux.Handle("/report", report)
 
-	server := httptools.CreateServer(*port, h)
+	server := httptools.CreateServer(*serverPort, mux)
 	server.Start()
+
+	buffer := new(bytes.Buffer)
+	requestBody := TimestampRequest{Value: time.Now().Format(time.RFC3339)}
+	json.NewEncoder(buffer).Encode(requestBody)
+
+	resp, _ := httpClient.Post(fmt.Sprintf("%s/gophersengineers", databaseURL), "application/json", buffer)
+	defer resp.Body.Close()
+
 	signal.WaitForTerminationSignal()
+}
+
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("content-type", "text/plain")
+	if os.Getenv(healthFailureEnv) == "true" {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("FAILURE"))
+	} else {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}
 }

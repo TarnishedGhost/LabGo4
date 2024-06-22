@@ -7,40 +7,44 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
-	"github.com/roman-mazur/architecture-practice-4-template/httptools"
-	"github.com/roman-mazur/architecture-practice-4-template/signal"
+	"github.com/TarnishedGhost/LabGo4/httptools"
+	"github.com/TarnishedGhost/LabGo4/signal"
 )
 
 var (
-	port = flag.Int("port", 8090, "load balancer port")
-	timeoutSec = flag.Int("timeout-sec", 3, "request timeout time in seconds")
-	https = flag.Bool("https", false, "whether backends support HTTPs")
-
-	traceEnabled = flag.Bool("trace", false, "whether to include tracing information into responses")
+	serverPort  = flag.Int("port", 8090, "load balancer port")
+	reqTimeout  = flag.Int("timeout-sec", 3, "request timeout time in seconds")
+	useHTTPS    = flag.Bool("https", false, "whether backends support HTTPs")
+	enableTrace = flag.Bool("trace", false, "whether to include tracing information into responses")
 )
 
 var (
-	timeout = time.Duration(*timeoutSec) * time.Second
-	serversPool = []string{
+	requestTimeout = time.Duration(*reqTimeout) * time.Second
+	backendServers = []string{
 		"server1:8080",
 		"server2:8080",
 		"server3:8080",
 	}
+	healthyServers    = make([]string, len(backendServers))
+	serverLoadTracker = make(map[string]int64)
+	mutex             sync.Mutex
+	healthCheckImpl   HealthChecker
+	requestHandler    RequestSender
 )
 
-func scheme() string {
-	if *https {
-		return "https"
-	}
-	return "http"
+type HealthChecker interface {
+	Validate(string) bool
 }
 
-func health(dst string) bool {
-	ctx, _ := context.WithTimeout(context.Background(), timeout)
+type BasicHealthChecker struct{}
+
+func (hc *BasicHealthChecker) Validate(server string) bool {
+	ctx, _ := context.WithTimeout(context.Background(), requestTimeout)
 	req, _ := http.NewRequestWithContext(ctx, "GET",
-		fmt.Sprintf("%s://%s/health", scheme(), dst), nil)
+		fmt.Sprintf("%s://%s/health", getScheme(), server), nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return false
@@ -51,59 +55,149 @@ func health(dst string) bool {
 	return true
 }
 
-func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
-	ctx, _ := context.WithTimeout(r.Context(), timeout)
-	fwdRequest := r.Clone(ctx)
-	fwdRequest.RequestURI = ""
-	fwdRequest.URL.Host = dst
-	fwdRequest.URL.Scheme = scheme()
-	fwdRequest.Host = dst
+type RequestSender interface {
+	Dispatch(*http.Request) (*http.Response, error)
+}
 
-	resp, err := http.DefaultClient.Do(fwdRequest)
-	if err == nil {
-		for k, values := range resp.Header {
-			for _, value := range values {
-				rw.Header().Add(k, value)
-			}
-		}
-		if *traceEnabled {
-			rw.Header().Set("lb-from", dst)
-		}
-		log.Println("fwd", resp.StatusCode, resp.Request.URL)
-		rw.WriteHeader(resp.StatusCode)
-		defer resp.Body.Close()
-		_, err := io.Copy(rw, resp.Body)
-		if err != nil {
-			log.Printf("Failed to write response: %s", err)
-		}
-		return nil
-	} else {
-		log.Printf("Failed to get response from %s: %s", dst, err)
+type BasicRequestSender struct{}
+
+func (rs *BasicRequestSender) Dispatch(fwdRequest *http.Request) (*http.Response, error) {
+	return http.DefaultClient.Do(fwdRequest)
+}
+
+func getScheme() string {
+	if *useHTTPS {
+		return "https"
+	}
+	return "http"
+}
+
+func relayRequest(target string, rw http.ResponseWriter, req *http.Request) error {
+	ctx, cancel := context.WithTimeout(req.Context(), requestTimeout)
+	defer cancel()
+	clonedRequest := req.Clone(ctx)
+	clonedRequest.RequestURI = ""
+	clonedRequest.URL.Host = target
+	clonedRequest.URL.Scheme = getScheme()
+	clonedRequest.Host = target
+
+	resp, err := requestHandler.Dispatch(clonedRequest)
+	if err != nil {
+		log.Printf("Failed to get response from %s: %s", target, err)
 		rw.WriteHeader(http.StatusServiceUnavailable)
 		return err
+	}
+	defer resp.Body.Close()
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			rw.Header().Add(key, value)
+		}
+	}
+
+	if *enableTrace {
+		rw.Header().Set("lb-from", target)
+	}
+
+	log.Println("relayed", resp.StatusCode, resp.Request.URL)
+	rw.WriteHeader(resp.StatusCode)
+
+	bytesCopied, err := io.Copy(rw, resp.Body)
+	if err != nil {
+		log.Printf("Failed to write response: %s", err)
+		return err
+	}
+
+	mutex.Lock()
+	serverLoadTracker[target] += bytesCopied
+	mutex.Unlock()
+
+	return nil
+}
+
+func selectServer() string {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	var leastLoadedServer string
+	var minLoad int64 = -1
+
+	for _, server := range healthyServers {
+		if load, exists := serverLoadTracker[server]; exists {
+			if minLoad == -1 || load < minLoad {
+				minLoad = load
+				leastLoadedServer = server
+			}
+		} else {
+			serverLoadTracker[server] = 0
+			if minLoad == -1 {
+				minLoad = 0
+				leastLoadedServer = server
+			}
+		}
+	}
+
+	return leastLoadedServer
+}
+
+func checkHealth(servers []string) {
+	healthStatusMap := make(map[string]bool)
+	for _, server := range servers {
+		healthStatusMap[server] = true
+	}
+
+	for i, server := range servers {
+		go func(server string) {
+			for range time.Tick(10 * time.Second) {
+				isHealthy := healthCheckImpl.Validate(server)
+				mutex.Lock()
+
+				if isHealthy {
+					healthStatusMap[server] = true
+					healthyServers[i] = server
+				} else {
+					healthStatusMap[server] = false
+					healthyServers[i] = ""
+				}
+
+				healthyServers = nil
+
+				for _, server := range servers {
+					if healthStatusMap[server] {
+						healthyServers = append(healthyServers, server)
+					}
+				}
+
+				mutex.Unlock()
+				log.Println(server, isHealthy)
+			}
+		}(server)
 	}
 }
 
 func main() {
 	flag.Parse()
 
-	// TODO: Використовуйте дані про стан сервреа, щоб підтримувати список тих серверів, яким можна відправляти ззапит.
-	for _, server := range serversPool {
-		server := server
-		go func() {
-			for range time.Tick(10 * time.Second) {
-				log.Println(server, health(server))
-			}
-		}()
-	}
+	healthCheckImpl = &BasicHealthChecker{}
+	requestHandler = &BasicRequestSender{}
 
-	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: Рееалізуйте свій алгоритм балансувальника.
-		forward(serversPool[0], rw, r)
+	checkHealth(backendServers)
+
+	loadBalancer := httptools.CreateServer(*serverPort, http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		targetServer := selectServer()
+		if targetServer == "" {
+			http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
+			return
+		}
+
+		err := relayRequest(targetServer, rw, req)
+		if err != nil {
+			return
+		}
 	}))
 
 	log.Println("Starting load balancer...")
-	log.Printf("Tracing support enabled: %t", *traceEnabled)
-	frontend.Start()
+	log.Printf("Tracing support enabled: %t", *enableTrace)
+	loadBalancer.Start()
 	signal.WaitForTerminationSignal()
 }
