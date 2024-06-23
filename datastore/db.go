@@ -11,77 +11,77 @@ import (
 )
 
 const (
-	outFileName = "current-data"
-	bufSize     = 8192
-	maxSegments = 3
+	outputFileName   = "current-data"
+	bufferSize       = 8192
+	segmentThreshold = 3
 )
 
-type hashIndex map[string]int64
+type hashMapIndex map[string]int64
 
-type IndexOp struct {
-	isWrite bool
-	key     string
-	index   int64
+type IndexOperation struct {
+	isWriteOperation bool
+	key              string
+	index            int64
 }
 
-type PutOp struct {
-	entry entry
-	resp  chan error
+type InsertOperation struct {
+	record entry
+	result chan error
 }
 
-type KeyPosition struct {
+type KeyLocation struct {
 	segment  *Segment
 	position int64
 }
 
-type ReadOp struct {
-	key     string
-	resp    chan string
-	errResp chan error
+type FetchOperation struct {
+	key        string
+	result     chan string
+	errorResult chan error
 }
 
-type SegmentManager struct {
+type SegmentController struct {
 	segments         []*Segment
 	lastSegmentIndex int
 }
 
-type Db struct {
-	out            *os.File
-	outPath        string
-	outOffset      int64
-	dir            string
-	segmentSize    int64
-	indexOps       chan IndexOp
-	keyPositions   chan *KeyPosition
-	putOps         chan PutOp
-	putDone        chan error
-	readOps        chan ReadOp
-	segmentManager *SegmentManager
-	fileMutex      sync.Mutex
-	indexMutex     sync.Mutex
+type Database struct {
+	outputFile      *os.File
+	outputFilePath  string
+	outputFileOffset int64
+	directory       string
+	segmentSize     int64
+	indexOperations chan IndexOperation
+	keyLocations    chan *KeyLocation
+	insertOperations chan InsertOperation
+	insertDone      chan error
+	fetchOperations chan FetchOperation
+	segmentController *SegmentController
+	fileMutex       sync.Mutex
+	indexMutex      sync.Mutex
 }
 
 type Segment struct {
-	index    hashIndex
+	index    hashMapIndex
 	filePath string
 }
 
 var (
-	ErrNotFound = fmt.Errorf("record does not exist")
+	ErrorRecordNotFound = fmt.Errorf("record does not exist")
 )
 
-func NewDb(dir string, segmentSize int64) (*Db, error) {
-	db := &Db{
-		segmentManager: &SegmentManager{
+func NewDatabase(directory string, segmentSize int64) (*Database, error) {
+	db := &Database{
+		segmentController: &SegmentController{
 			segments: make([]*Segment, 0),
 		},
-		dir:          dir,
-		segmentSize:  segmentSize,
-		indexOps:     make(chan IndexOp),
-		keyPositions: make(chan *KeyPosition),
-		putOps:       make(chan PutOp),
-		putDone:      make(chan error),
-		readOps:      make(chan ReadOp, 10), // Обмеження кількості паралельних операцій читання
+		directory:       directory,
+		segmentSize:     segmentSize,
+		indexOperations: make(chan IndexOperation),
+		keyLocations:    make(chan *KeyLocation),
+		insertOperations: make(chan InsertOperation),
+		insertDone:      make(chan error),
+		fetchOperations: make(chan FetchOperation, 10), // Limit the number of concurrent read operations
 	}
 
 	if err := db.createSegment(); err != nil {
@@ -93,28 +93,28 @@ func NewDb(dir string, segmentSize int64) (*Db, error) {
 	}
 
 	db.startIndexRoutine()
-	db.startPutRoutine()
-	db.startReadWorkers(5)
+	db.startInsertRoutine()
+	db.startFetchWorkers(5)
 
 	return db, nil
 }
 
-func (db *Db) Close() error {
-	return db.out.Close()
+func (db *Database) Close() error {
+	return db.outputFile.Close()
 }
 
-func (db *Db) startIndexRoutine() {
+func (db *Database) startIndexRoutine() {
 	go func() {
-		for op := range db.indexOps {
+		for operation := range db.indexOperations {
 			db.indexMutex.Lock()
-			if op.isWrite {
-				db.setKey(op.key, op.index)
+			if operation.isWriteOperation {
+				db.setKey(operation.key, operation.index)
 			} else {
-				s, p, err := db.getSegmentAndPos(op.key)
+				segment, position, err := db.getSegmentAndPosition(operation.key)
 				if err != nil {
-					db.keyPositions <- nil
+					db.keyLocations <- nil
 				} else {
-					db.keyPositions <- &KeyPosition{s, p}
+					db.keyLocations <- &KeyLocation{segment, position}
 				}
 			}
 			db.indexMutex.Unlock()
@@ -122,53 +122,53 @@ func (db *Db) startIndexRoutine() {
 	}()
 }
 
-func (db *Db) startPutRoutine() {
+func (db *Database) startInsertRoutine() {
 	go func() {
 		for {
-			op := <-db.putOps
+			operation := <-db.insertOperations
 			db.fileMutex.Lock()
-			length := op.entry.GetLength()
-			stat, err := db.out.Stat()
+			length := operation.record.GetLength()
+			stats, err := db.outputFile.Stat()
 			if err != nil {
-				op.resp <- err
+				operation.result <- err
 				db.fileMutex.Unlock()
 				continue
 			}
-			if stat.Size()+length > db.segmentSize {
+			if stats.Size()+length > db.segmentSize {
 				err := db.createSegment()
 				if err != nil {
-					op.resp <- err
+					operation.result <- err
 					db.fileMutex.Unlock()
 					continue
 				}
 			}
-			n, err := db.out.Write(op.entry.Encode())
+			n, err := db.outputFile.Write(operation.record.Encode())
 			if err == nil {
-				db.indexOps <- IndexOp{
-					isWrite: true,
-					key:     op.entry.key,
-					index:   int64(n),
+				db.indexOperations <- IndexOperation{
+					isWriteOperation: true,
+					key:              operation.record.key,
+					index:            int64(n),
 				}
 			}
-			op.resp <- nil
+			operation.result <- nil
 			db.fileMutex.Unlock()
 		}
 	}()
 }
 
-func (db *Db) startReadWorkers(numWorkers int) {
-	for i := 0; i < numWorkers; i++ {
+func (db *Database) startFetchWorkers(workerCount int) {
+	for i := 0; i < workerCount; i++ {
 		go func() {
-			for op := range db.readOps {
-				keyPos := db.getPos(op.key)
-				if keyPos == nil {
-					op.errResp <- ErrNotFound
+			for operation := range db.fetchOperations {
+				keyLocation := db.getPosition(operation.key)
+				if keyLocation == nil {
+					operation.errorResult <- ErrorRecordNotFound
 				} else {
-					value, err := keyPos.segment.getFromSegment(keyPos.position)
+					value, err := keyLocation.segment.getFromSegment(keyLocation.position)
 					if err != nil {
-						op.errResp <- err
+						operation.errorResult <- err
 					} else {
-						op.resp <- value
+						operation.result <- value
 					}
 				}
 			}
@@ -176,84 +176,84 @@ func (db *Db) startReadWorkers(numWorkers int) {
 	}
 }
 
-func (db *Db) createSegment() error {
+func (db *Database) createSegment() error {
 	filePath := db.generateNewFileName()
-	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0777)
+	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0777)
 	if err != nil {
 		return err
 	}
 
 	newSegment := &Segment{
 		filePath: filePath,
-		index:    make(hashIndex),
+		index:    make(hashMapIndex),
 	}
 
-	db.out = f
-	db.outOffset = 0
-	db.outPath = filePath
-	db.segmentManager.segments = append(db.segmentManager.segments, newSegment)
-	if len(db.segmentManager.segments) >= maxSegments {
+	db.outputFile = file
+	db.outputFileOffset = 0
+	db.outputFilePath = filePath
+	db.segmentController.segments = append(db.segmentController.segments, newSegment)
+	if len(db.segmentController.segments) >= segmentThreshold {
 		db.performOldSegmentsCompaction()
 	}
 
 	return nil
 }
 
-func (db *Db) generateNewFileName() string {
-	result := filepath.Join(db.dir, fmt.Sprintf("%s%d", outFileName, db.segmentManager.lastSegmentIndex))
-	db.segmentManager.lastSegmentIndex++
+func (db *Database) generateNewFileName() string {
+	result := filepath.Join(db.directory, fmt.Sprintf("%s%d", outputFileName, db.segmentController.lastSegmentIndex))
+	db.segmentController.lastSegmentIndex++
 	return result
 }
 
-func (db *Db) performOldSegmentsCompaction() {
+func (db *Database) performOldSegmentsCompaction() {
 	go func() {
 		filePath := db.generateNewFileName()
 		newSegment := &Segment{
 			filePath: filePath,
-			index:    make(hashIndex),
+			index:    make(hashMapIndex),
 		}
 		var offset int64
-		f, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+		file, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
 		if err != nil {
 			return
 		}
-		lastSegmentIndex := len(db.segmentManager.segments) - 2
+		lastSegmentIndex := len(db.segmentController.segments) - 2
 		for i := 0; i <= lastSegmentIndex; i++ {
-			s := db.segmentManager.segments[i]
-			for key, index := range s.index {
+			segment := db.segmentController.segments[i]
+			for key, index := range segment.index {
 				if i < lastSegmentIndex {
-					isInNewerSegments := findKeyInSegments(db.segmentManager.segments[i+1:lastSegmentIndex+1], key)
+					isInNewerSegments := findKeyInSegments(db.segmentController.segments[i+1:lastSegmentIndex+1], key)
 					if isInNewerSegments {
 						continue
 					}
 				}
-				value, _ := s.getFromSegment(index)
-				e := entry{
+				value, _ := segment.getFromSegment(index)
+				record := entry{
 					key:   key,
 					value: value,
 				}
-				n, err := f.Write(e.Encode())
+				n, err := file.Write(record.Encode())
 				if err == nil {
 					newSegment.index[key] = offset
 					offset += int64(n)
 				}
 			}
 		}
-		db.segmentManager.segments = []*Segment{newSegment, db.getLastSegment()}
+		db.segmentController.segments = []*Segment{newSegment, db.getLastSegment()}
 	}()
 }
 
 func findKeyInSegments(segments []*Segment, key string) bool {
-	for _, s := range segments {
-		if _, ok := s.index[key]; ok {
+	for _, segment := range segments {
+		if _, ok := segment.index[key]; ok {
 			return true
 		}
 	}
 	return false
 }
 
-func (db *Db) recoverAll() error {
-	for _, segment := range db.segmentManager.segments {
+func (db *Database) recoverAll() error {
+	for _, segment := range db.segmentController.segments {
 		if err := db.recoverSegment(segment); err != nil {
 			return err
 		}
@@ -261,31 +261,31 @@ func (db *Db) recoverAll() error {
 	return nil
 }
 
-func (db *Db) recoverSegment(segment *Segment) error {
-	f, err := os.Open(segment.filePath)
+func (db *Database) recoverSegment(segment *Segment) error {
+	file, err := os.Open(segment.filePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer file.Close()
 
-	if err := db.recover(f); err != nil && err != io.EOF {
+	if err := db.recover(file); err != nil && err != io.EOF {
 		return err
 	}
 
 	return nil
 }
 
-func (db *Db) recover(f *os.File) error {
+func (db *Database) recover(file *os.File) error {
 	var err error
-	var buf [bufSize]byte
+	var buffer [bufferSize]byte
 
-	in := bufio.NewReaderSize(f, bufSize)
+	reader := bufio.NewReaderSize(file, bufferSize)
 	for err == nil {
 		var (
 			header, data []byte
 			n            int
 		)
-		header, err = in.Peek(bufSize)
+		header, err = reader.Peek(bufferSize)
 		if err == io.EOF {
 			if len(header) == 0 {
 				return err
@@ -295,89 +295,89 @@ func (db *Db) recover(f *os.File) error {
 		}
 		size := binary.LittleEndian.Uint32(header)
 
-		if size < bufSize {
-			data = buf[:size]
+		if size < bufferSize {
+			data = buffer[:size]
 		} else {
 			data = make([]byte, size)
 		}
-		n, err = in.Read(data)
+		n, err = reader.Read(data)
 
 		if err == nil {
 			if n != int(size) {
 				return fmt.Errorf("corrupted file")
 			}
 
-			var e entry
-			e.Decode(data)
-			db.setKey(e.key, int64(n))
+			var record entry
+			record.Decode(data)
+			db.setKey(record.key, int64(n))
 		}
 	}
 	return err
 }
 
-func (db *Db) setKey(key string, n int64) {
-	db.getLastSegment().index[key] = db.outOffset
-	db.outOffset += n
+func (db *Database) setKey(key string, n int64) {
+	db.getLastSegment().index[key] = db.outputFileOffset
+	db.outputFileOffset += n
 }
 
-func (db *Db) getSegmentAndPos(key string) (*Segment, int64, error) {
-	for i := range db.segmentManager.segments {
-		s := db.segmentManager.segments[len(db.segmentManager.segments)-i-1]
-		pos, ok := s.index[key]
+func (db *Database) getSegmentAndPosition(key string) (*Segment, int64, error) {
+	for i := range db.segmentController.segments {
+		segment := db.segmentController.segments[len(db.segmentController.segments)-i-1]
+		position, ok := segment.index[key]
 		if ok {
-			return s, pos, nil
+			return segment, position, nil
 		}
 	}
 
-	return nil, 0, ErrNotFound
+	return nil, 0, ErrorRecordNotFound
 }
 
-func (db *Db) getPos(key string) *KeyPosition {
-	op := IndexOp{
-		isWrite: false,
-		key:     key,
+func (db *Database) getPosition(key string) *KeyLocation {
+	operation := IndexOperation{
+		isWriteOperation: false,
+		key:              key,
 	}
-	db.indexOps <- op
-	return <-db.keyPositions
+	db.indexOperations <- operation
+	return <-db.keyLocations
 }
 
-func (db *Db) Get(key string) (string, error) {
-	resp := make(chan string)
-	errResp := make(chan error)
-	db.readOps <- ReadOp{
-		key:     key,
-		resp:    resp,
-		errResp: errResp,
+func (db *Database) Get(key string) (string, error) {
+	result := make(chan string)
+	errorResult := make(chan error)
+	db.fetchOperations <- FetchOperation{
+		key:        key,
+		result:     result,
+		errorResult: errorResult,
 	}
 
 	select {
-	case value := <-resp:
+	case value := <-result:
 		return value, nil
-	case err := <-errResp:
+	case err := <-errorResult:
 		return "", err
 	}
 }
 
-func (db *Db) Put(key, value string) error {
-	resp := make(chan error)
-	db.putOps <- PutOp{
-		entry: entry{
+func (db *Database) Put(key, value string) error {
+	result := make(chan error)
+	db.insertOperations <- InsertOperation{
+		record: entry{
 			key:   key,
 			value: value,
 		},
-		resp: resp,
+		result: result,
 	}
-	err := <-resp
-	close(resp)
+	err := <-result
+	close(result)
 	return err
 }
 
-func (db *Db) getLastSegment() *Segment {
-	return db.segmentManager.segments[len(db.segmentManager.segments)-1]
+func (db *Database) getLastSegment() *Segment {
+	return db.segmentController.segments[len(db.segmentController.segments)-1]
 }
 
-func (s *Segment) getFromSegment(position int64) (string, error) {
-	file, err := os.Open(s.filePath)
+func (segment *Segment) getFromSegment(position int64) (string, error) {
+	file, err := os.Open(segment.filePath)
 	if err != nil {
 		return "", err
 	}
