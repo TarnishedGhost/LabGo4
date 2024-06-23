@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	outFileName      = "current-data"
-	bufSize          = 8192
-	segmentThreshold = 3
+	outFileName = "current-data"
+	bufSize     = 8192
+	maxSegments = 3
 )
 
 type hashIndex map[string]int64
@@ -192,7 +192,7 @@ func (db *Db) createSegment() error {
 	db.outOffset = 0
 	db.outPath = filePath
 	db.segmentManager.segments = append(db.segmentManager.segments, newSegment)
-	if len(db.segmentManager.segments) >= segmentThreshold {
+	if len(db.segmentManager.segments) >= maxSegments {
 		db.performOldSegmentsCompaction()
 	}
 
